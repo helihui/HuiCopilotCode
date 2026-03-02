@@ -8,7 +8,7 @@
 
 ### 现象
 
-```
+```text
 failed to run 'cargo metadata' command to get workspace directory:
 failed to run command cargo metadata --no-deps --format-version 1: program not found
 ```
@@ -51,7 +51,7 @@ Profile 路径：`D:\OneDrive\文档\WindowsPowerShell\Microsoft.PowerShell_prof
 
 ### 解决方案
 
-后端 `spawn_pty_shell`（`lib.rs`）已自动读取 `~/.claude/config.json` 动态注入环境变量并启动 `claude`，**前端无需也不应再重复发送**。删除 `EmbeddedTerminal.tsx` 中多余的 `write_to_pty`  调用即可。
+后端 `spawn_pty_shell`（`lib.rs`）已自动读取 `~/.claude/config.json` 动态注入环境变量并启动 `claude`，**前端无需也不应再重复发送**。删除 `EmbeddedTerminal.tsx` 中多余的 `write_to_pty` 调用即可。
 
 ---
 
@@ -96,5 +96,48 @@ warning: unused import: `tauri::Manager`
 ### 解决方案
 
 删除 `lib.rs` 中对应的 `use tauri::Manager;` 语句即可消除 warning。
+
+---
+
+## 坑 5：Tauri 打包产物隐藏深且难以查找
+
+### 现象
+
+运行 `npm run tauri build` 后，构建成功但不知道生成的 `.msi` 或 `.exe` 安装程序在哪。
+
+### 原因
+
+Tauri 的默认打包目录比较深：
+- MSI: `src-tauri\target\release\bundle\msi\`
+- EXE: `src-tauri\target\release\bundle\nsis\`
+
+### 解决方案
+
+**一键导出命令（在 PowerShell 中运行）：**
+直接将最新产物提取到项目根目录，方便分发：
+```powershell
+# 将产物复制到项目根目录
+Copy-Item "src-tauri\target\release\bundle\msi\*.msi" "."; `
+Copy-Item "src-tauri\target\release\bundle\nsis\*.exe" "."
 ```
 
+---
+
+## 坑 6：Claude Code 强制弹出 OAuth 引导弹窗
+
+### 现象
+
+即使配置了 API Key，第一次启动 `claude` 也会强制打开浏览器引导认证，且某些环境下会覆盖用户的环境变量配置。
+
+### 原因
+
+Claude Code 启动时会检查 `~/.claude.json` 文件。如果该文件不存在或 `hasCompletedOnboarding` 节点未设为 `true`，则会强制进入 OAuth 流程。
+
+### 解决方案
+
+在后端的 `spawn_pty_shell` 函数（`lib.rs`）中实现自动化处理：
+1. **自动注入配置**：在启动 PTY 之前，程序会自动检查并更新 `~/.claude.json`，强制设置 `"hasCompletedOnboarding": true`。
+2. **清除冲突**：如果使用第三方模型，自动移除 `oauthAccount` 和 `primaryApiKey` 以防止 session 冲突。
+3. **设置 apiKeyHelper**：在 `~/.claude/settings.json` 中配置 `apiKeyHelper`（例如 `cmd /c echo <YOUR_KEY>`），这是绕过浏览器授权的最上层官方手段。
+
+> 💡 **效果**：生成安装包后，新电脑安装即用，无需任何手动浏览器授权。

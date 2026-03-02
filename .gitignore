@@ -22,3 +22,17 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Tauri build artifacts
+src-tauri/target
+src-tauri/binaries
+src-tauri/Portable
+
+# Installers
+*.exe
+*.msi
+*.zip
+*.dmg
+*.app
+*.deb
+*.rpm

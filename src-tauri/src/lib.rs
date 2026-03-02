@@ -595,44 +595,49 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
     *state.writer.lock().unwrap() = Some(writer);
     *state.master.lock().unwrap() = Some(pair.master);
 
-    // 当使用第三方提供商时，自动处理 ~/.claude.json：
-    //   1. 移除 oauthAccount / primaryApiKey（避免 OAuth 流程劫持）
-    //   2. 无条件写入 hasCompletedOnboarding=true（跳过首次引导弹窗）
-    // 同时写入 ~/.claude/settings.json 的 apiKeyHelper，作为终极绕过手段
+    // === 核心绕过逻辑：设置 ~/.claude.json 的 hasCompletedOnboarding 为 true ===
+    // 无论是否使用第三方提供商，都确保此项为 true 以防止强制跳转浏览器 OAuth
+    let claude_json_path = home_dir.join(".claude.json");
+    let mut cj: serde_json::Value = if claude_json_path.exists() {
+        std::fs::read_to_string(&claude_json_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = cj.as_object_mut() {
+        // 只有当不是 "claude" 官方提供商时，才移除 OAuth 绑定
+        let is_third_party = if config_path.exists() {
+            std::fs::read_to_string(&config_path).ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|j| j.get("provider").and_then(|p| p.as_str()).map(|s| s != "claude"))
+                .unwrap_or(false)
+        } else { false };
+
+        if is_third_party {
+            obj.remove("oauthAccount");
+            obj.remove("primaryApiKey");
+        }
+        // 无条件确保 onboarding 完成（新机器也生效）
+        obj.insert("hasCompletedOnboarding".to_string(), serde_json::json!(true));
+    }
+    if let Ok(new_content) = serde_json::to_string_pretty(&cj) {
+        let _ = std::fs::write(&claude_json_path, new_content);
+        let _ = app.emit("install-log", "[DEBUG] ~/.claude.json 状态已同步 (hasCompletedOnboarding: true)".to_string());
+    }
+
+    // 当使用第三方提供商时，额外配置 ~/.claude/settings.json 的 apiKeyHelper
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(provider) = json.get("provider").and_then(|v| v.as_str()) {
                     if provider != "claude" {
-                        // === 处理 ~/.claude.json ===
-                        let claude_json_path = home_dir.join(".claude.json");
-                        // 若文件不存在则创建最小骨架
-                        let mut cj: serde_json::Value = if claude_json_path.exists() {
-                            std::fs::read_to_string(&claude_json_path)
-                                .ok()
-                                .and_then(|s| serde_json::from_str(&s).ok())
-                                .unwrap_or_else(|| serde_json::json!({}))
-                        } else {
-                            serde_json::json!({})
-                        };
-                        if let Some(obj) = cj.as_object_mut() {
-                            obj.remove("oauthAccount");
-                            obj.remove("primaryApiKey");
-                            // 无条件确保 onboarding 完成（新机器也生效）
-                            obj.insert("hasCompletedOnboarding".to_string(), serde_json::json!(true));
-                        }
-                        if let Ok(new_content) = serde_json::to_string_pretty(&cj) {
-                            let _ = std::fs::write(&claude_json_path, new_content);
-                            let _ = app.emit("install-log", "[DEBUG] ~/.claude.json 已更新：移除 OAuth 绑定，标记 onboarding 完成".to_string());
-                        }
-
                         // === 写入 ~/.claude/settings.json 的 apiKeyHelper（终极绕过手段）===
-                        // Claude Code 会执行此命令获取 Key，完全绕过 OAuth 流程
                         if let Some(api_key) = json.get("apiKey").and_then(|v| v.as_str()) {
                             let settings_dir = home_dir.join(".claude");
                             let _ = std::fs::create_dir_all(&settings_dir);
                             let settings_path = settings_dir.join("settings.json");
-                            // 读取已有 settings，避免覆盖其他配置
                             let mut settings: serde_json::Value = if settings_path.exists() {
                                 std::fs::read_to_string(&settings_path)
                                     .ok()
@@ -641,7 +646,6 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
                             } else {
                                 serde_json::json!({})
                             };
-                            // apiKeyHelper: Claude Code 执行此 echo 命令来获取 API Key
                             let helper_cmd = if cfg!(target_os = "windows") {
                                 format!("cmd /c echo {}", api_key)
                             } else {
@@ -652,7 +656,6 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
                             }
                             if let Ok(settings_str) = serde_json::to_string_pretty(&settings) {
                                 let _ = std::fs::write(&settings_path, settings_str);
-                                let _ = app.emit("install-log", "[DEBUG] ~/.claude/settings.json 已写入 apiKeyHelper".to_string());
                             }
                         }
                     }
