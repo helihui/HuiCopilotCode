@@ -26,7 +26,6 @@ dist-ssr
 # Tauri build artifacts
 src-tauri/target
 src-tauri/binaries
-src-tauri/Portable
 
 # Installers
 *.exe
