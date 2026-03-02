@@ -77,8 +77,7 @@ export function EmbeddedTerminal({ onClose }: EmbeddedTerminalProps) {
       try {
         await invoke("spawn_pty_shell");
         term.write('\x1b[32mPTY 连接成功。终端已就绪。\x1b[0m\r\n\r\n');
-        // 自动输入 claude 并回车
-        invoke("write_to_pty", { data: "claude\r" }).catch(console.error);
+        // 环境变量注入和 claude 启动命令由后端 spawn_pty_shell 动态读取配置完成，无需前端重复发送
         handleResize();
       } catch (err) {
         term.write(`\r\n\x1b[31m启动终端失败: ${err}\x1b[0m\r\n`);

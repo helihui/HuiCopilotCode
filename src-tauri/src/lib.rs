@@ -188,7 +188,6 @@ fn check_portable_node(app: AppHandle) -> Result<bool, String> {
 async fn install_claude_portable(app: AppHandle, is_mirror: bool) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    use tauri::Manager;
 
     let root_str = get_portable_dir(app.clone())?;
     let root = PathBuf::from(&root_str);
@@ -514,9 +513,18 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
     let portable_root = PathBuf::from(portable_root_str);
     let claude_bin_dir = portable_root.join("ClaudeBin");
     let node_dir = portable_root.join("Node");
+    let git_dir = portable_root.join("Git");
     
     // 我们强制设置 npm_config_prefix，让内部终端调用的 npm 指向便携目录
     cmd.env("npm_config_prefix", claude_bin_dir.to_string_lossy().to_string());
+
+    // 设置 Git Bash 路径 (Claude Code 在 Windows 上需要 bash.exe 来运行底层脚本)
+    if cfg!(target_os = "windows") {
+        let git_bash = git_dir.join("bin").join("bash.exe");
+        if git_bash.exists() {
+            cmd.env("CLAUDE_CODE_GIT_BASH_PATH", git_bash.to_string_lossy().to_string());
+        }
+    }
 
     // 2. 将 PortableNode 和 ClaudeBin 的 bin 目录注入到 PATH 最前端
     let mut new_paths = vec![];
@@ -534,6 +542,7 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
 
     if cfg!(target_os = "windows") {
         new_paths.push(node_dir.to_string_lossy().to_string());
+        new_paths.push(git_dir.join("cmd").to_string_lossy().to_string());
     } else {
         new_paths.push(node_dir.join("bin").to_string_lossy().to_string());
     }
@@ -586,32 +595,64 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
     *state.writer.lock().unwrap() = Some(writer);
     *state.master.lock().unwrap() = Some(pair.master);
 
-    // 当使用第三方提供商时，临时清除 ~/.claude.json 中的 OAuth 绑定
-    // 否则 Claude Code 会优先使用 primaryApiKey 去走官方认证流程
+    // 当使用第三方提供商时，自动处理 ~/.claude.json：
+    //   1. 移除 oauthAccount / primaryApiKey（避免 OAuth 流程劫持）
+    //   2. 无条件写入 hasCompletedOnboarding=true（跳过首次引导弹窗）
+    // 同时写入 ~/.claude/settings.json 的 apiKeyHelper，作为终极绕过手段
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(provider) = json.get("provider").and_then(|v| v.as_str()) {
                     if provider != "claude" {
-                        // 修改 ~/.claude.json，移除 oauthAccount 和 primaryApiKey
+                        // === 处理 ~/.claude.json ===
                         let claude_json_path = home_dir.join(".claude.json");
-                        if claude_json_path.exists() {
-                            if let Ok(cj_content) = std::fs::read_to_string(&claude_json_path) {
-                                if let Ok(mut cj) = serde_json::from_str::<serde_json::Value>(&cj_content) {
-                                    let modified = cj.get("oauthAccount").is_some() || cj.get("primaryApiKey").is_some();
-                                    if modified {
-                                        cj.as_object_mut().map(|obj| {
-                                            obj.remove("oauthAccount");
-                                            obj.remove("primaryApiKey");
-                                            // 确保 onboarding 标记为完成
-                                            obj.insert("hasCompletedOnboarding".to_string(), serde_json::json!(true));
-                                        });
-                                        if let Ok(new_content) = serde_json::to_string_pretty(&cj) {
-                                            let _ = std::fs::write(&claude_json_path, new_content);
-                                            let _ = app.emit("install-log", "[DEBUG] 已清除 ~/.claude.json 中的 OAuth 绑定，强制使用第三方 API Key".to_string());
-                                        }
-                                    }
-                                }
+                        // 若文件不存在则创建最小骨架
+                        let mut cj: serde_json::Value = if claude_json_path.exists() {
+                            std::fs::read_to_string(&claude_json_path)
+                                .ok()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_else(|| serde_json::json!({}))
+                        } else {
+                            serde_json::json!({})
+                        };
+                        if let Some(obj) = cj.as_object_mut() {
+                            obj.remove("oauthAccount");
+                            obj.remove("primaryApiKey");
+                            // 无条件确保 onboarding 完成（新机器也生效）
+                            obj.insert("hasCompletedOnboarding".to_string(), serde_json::json!(true));
+                        }
+                        if let Ok(new_content) = serde_json::to_string_pretty(&cj) {
+                            let _ = std::fs::write(&claude_json_path, new_content);
+                            let _ = app.emit("install-log", "[DEBUG] ~/.claude.json 已更新：移除 OAuth 绑定，标记 onboarding 完成".to_string());
+                        }
+
+                        // === 写入 ~/.claude/settings.json 的 apiKeyHelper（终极绕过手段）===
+                        // Claude Code 会执行此命令获取 Key，完全绕过 OAuth 流程
+                        if let Some(api_key) = json.get("apiKey").and_then(|v| v.as_str()) {
+                            let settings_dir = home_dir.join(".claude");
+                            let _ = std::fs::create_dir_all(&settings_dir);
+                            let settings_path = settings_dir.join("settings.json");
+                            // 读取已有 settings，避免覆盖其他配置
+                            let mut settings: serde_json::Value = if settings_path.exists() {
+                                std::fs::read_to_string(&settings_path)
+                                    .ok()
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or_else(|| serde_json::json!({}))
+                            } else {
+                                serde_json::json!({})
+                            };
+                            // apiKeyHelper: Claude Code 执行此 echo 命令来获取 API Key
+                            let helper_cmd = if cfg!(target_os = "windows") {
+                                format!("cmd /c echo {}", api_key)
+                            } else {
+                                format!("echo {}", api_key)
+                            };
+                            if let Some(obj) = settings.as_object_mut() {
+                                obj.insert("apiKeyHelper".to_string(), serde_json::json!(helper_cmd));
+                            }
+                            if let Ok(settings_str) = serde_json::to_string_pretty(&settings) {
+                                let _ = std::fs::write(&settings_path, settings_str);
+                                let _ = app.emit("install-log", "[DEBUG] ~/.claude/settings.json 已写入 apiKeyHelper".to_string());
                             }
                         }
                     }
@@ -667,22 +708,25 @@ fn spawn_pty_shell(app: AppHandle, state: tauri::State<'_, PtyState>) -> Result<
                     let _ = app.emit("install-log", "[DEBUG] ⚠️ 未找到 provider 字段！".to_string());
                 }
 
-                // 注入模型名称
+                // 注入模型名称（同时设置 ANTHROPIC_DEFAULT_SONNET_MODEL 以兼容内部模型映射）
                 if let Some(model_name) = json.get("modelName").and_then(|v| v.as_str()) {
                     if !model_name.is_empty() {
                         let _ = app.emit("install-log", format!("[DEBUG] 模型: {}", model_name));
                         if cfg!(target_os = "windows") {
                             init_cmds.push(format!("$env:ANTHROPIC_MODEL='{}'", model_name));
+                            // 某些版本 Claude Code 内部用 sonnet 别名调用，显式映射到国产模型
+                            init_cmds.push(format!("$env:ANTHROPIC_DEFAULT_SONNET_MODEL='{}'", model_name));
                         } else {
                             init_cmds.push(format!("export ANTHROPIC_MODEL='{}'", model_name));
+                            init_cmds.push(format!("export ANTHROPIC_DEFAULT_SONNET_MODEL='{}'", model_name));
                         }
                     }
                 }
 
                 if !init_cmds.is_empty() {
-                    // 用分号连接所有命令，清屏，然后自动启动 claude
-                    let full_cmd = format!("{}; cls; claude\r\n", init_cmds.join("; "));
-                    let _ = app.emit("install-log", format!("[DEBUG] 注入命令: {}", init_cmds.join("; ")));
+                    // 用分号将所有环境变量命令和 claude 拼成一行执行，确保同一 session 内生效
+                    let full_cmd = format!("{}; claude\r\n", init_cmds.join("; "));
+                    let _ = app.emit("install-log", format!("[DEBUG] 注入命令: {}", full_cmd));
                     if let Some(ref mut w) = *state.writer.lock().unwrap() {
                         let _ = w.write_all(full_cmd.as_bytes());
                         let _ = w.flush();
